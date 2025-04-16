@@ -1,7 +1,6 @@
 import { ZipContent, FileItem } from "../components/ZipContentCard";
 import JSZip from "jszip";
 import { v4 as uuidv4 } from "uuid";
-import { saveAs } from "file-saver";
 
 /**
  * Extracts the contents of a zip file
@@ -192,11 +191,199 @@ export const unzipFile = async (file: File): Promise<ZipContent> => {
 };
 
 /**
+ * Analyzes a result.json file and returns key information
+ */
+export const analyzeResultJson = async (
+  content: ZipContent
+): Promise<{
+  id: number;
+  messageCount: number;
+  name: string;
+  dateRange: { from: string; to: string };
+}> => {
+  if (!content.originalFile || !content.resultJsonPath) {
+    throw new Error("No valid result.json found in the export");
+  }
+
+  const zip = await JSZip.loadAsync(content.originalFile);
+  const resultJsonPath = content.resultJsonPath;
+
+  // Extract result.json content
+  const resultJsonEntry = zip.file(resultJsonPath);
+  if (!resultJsonEntry) {
+    throw new Error(`Could not find ${resultJsonPath} in the archive`);
+  }
+
+  const jsonText = await resultJsonEntry.async("string");
+
+  try {
+    const resultData = JSON.parse(jsonText);
+    const messages = resultData.messages || [];
+    let fromDate = "";
+    let toDate = "";
+
+    // Find the date range
+    if (messages.length > 0) {
+      // Sort messages by date
+      const sortedMessages = [...messages].sort((a, b) => {
+        const dateA = new Date(a.date || 0);
+        const dateB = new Date(b.date || 0);
+        return dateA.getTime() - dateB.getTime();
+      });
+
+      const firstMessage = sortedMessages[0];
+      const lastMessage = sortedMessages[sortedMessages.length - 1];
+
+      // Extract just the date part (YYYY-MM-DD) from the date string
+      fromDate = firstMessage.date ? firstMessage.date.split("T")[0] : "";
+      toDate = lastMessage.date ? lastMessage.date.split("T")[0] : "";
+    }
+
+    return {
+      id: resultData.id || 0,
+      messageCount: messages.length,
+      name: resultData.name || "Unknown Chat",
+      dateRange: {
+        from: fromDate,
+        to: toDate,
+      },
+    };
+  } catch (error) {
+    throw new Error(
+      `Error parsing result.json: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
+  }
+};
+
+/**
+ * Combines multiple result.json files into a single one
+ */
+export const combineResultJson = async (
+  contents: ZipContent[]
+): Promise<Uint8Array> => {
+  if (contents.length === 0) {
+    throw new Error("No valid Telegram exports to combine");
+  }
+
+  // Parse each result.json file
+  const resultJsons = [];
+  let firstChatId: number | null = null;
+  let chatName: string | null = null;
+  let chatType: string | null = null;
+
+  for (const content of contents) {
+    if (!content.originalFile || !content.resultJsonPath) {
+      continue;
+    }
+
+    try {
+      const zip = await JSZip.loadAsync(content.originalFile);
+      const resultJsonPath = content.resultJsonPath;
+
+      const resultJsonEntry = zip.file(resultJsonPath);
+      if (!resultJsonEntry) {
+        continue;
+      }
+
+      const jsonText = await resultJsonEntry.async("string");
+      const resultData = JSON.parse(jsonText);
+
+      // Validate chat ID matching
+      if (firstChatId === null) {
+        firstChatId = resultData.id;
+        chatName = resultData.name;
+        chatType = resultData.type;
+      } else if (firstChatId !== resultData.id) {
+        throw new Error(
+          `Chat ID mismatch: ${firstChatId} !== ${resultData.id}. Cannot combine different chats.`
+        );
+      }
+
+      resultJsons.push(resultData);
+    } catch (error) {
+      throw new Error(
+        `Error processing ${content.name}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  if (resultJsons.length === 0) {
+    throw new Error("No valid result.json files found");
+  }
+
+  // Create the combined result.json
+  const combinedResult = {
+    name: chatName,
+    type: chatType,
+    id: firstChatId,
+    messages: [] as TelegramMessage[], // Will hold the combined messages
+  };
+
+  // Interface for Telegram message objects
+  interface TelegramMessage {
+    id: number;
+    type: string;
+    date: string;
+    date_unixtime: string;
+    from?: string;
+    from_id?: string;
+    text?: string | { type: string; text: string }[];
+    text_entities?: { type: string; text: string }[];
+    edited?: string;
+    edited_unixtime?: string;
+    [key: string]: unknown; // For other properties we might not know about
+  }
+
+  // Map to store messages by ID to avoid duplicates
+  const messagesById = new Map<number, TelegramMessage>();
+
+  // Process all messages from all files
+  for (const resultJson of resultJsons) {
+    if (!resultJson.messages || !Array.isArray(resultJson.messages)) {
+      continue;
+    }
+
+    for (const message of resultJson.messages as TelegramMessage[]) {
+      const messageId = message.id;
+
+      // Only add if we don't have this message yet, or if we're replacing with a newer version
+      if (
+        !messagesById.has(messageId) ||
+        (message.edited && !messagesById.get(messageId)?.edited)
+      ) {
+        messagesById.set(messageId, message);
+      }
+    }
+  }
+
+  // Convert the map values to an array and sort by ID
+  combinedResult.messages = Array.from(messagesById.values()).sort(
+    (a, b) => a.id - b.id
+  );
+
+  // Convert to JSON string and then to Uint8Array
+  const combinedJsonString = JSON.stringify(combinedResult, null, 1);
+  const encoder = new TextEncoder();
+  return encoder.encode(combinedJsonString);
+};
+
+/**
  * Combines multiple zip contents into a single downloadable zip file
+ * Returns statistics about the combined result
  */
 export const combineZipContents = async (
   contents: ZipContent[]
-): Promise<void> => {
+): Promise<{
+  blob: Blob;
+  totalMessages: number;
+  duplicateMessages: number;
+  folders: string[];
+  totalFiles: number;
+}> => {
   // Only process valid contents
   const validContents = contents.filter((content) => !content.error);
   if (validContents.length === 0) {
@@ -205,6 +392,8 @@ export const combineZipContents = async (
 
   const combinedZip = new JSZip();
   const fileMap = new Map<string, { path: string; timestamp: number }>();
+  const folders = new Set<string>();
+  let totalFiles = 0;
 
   // Process each zip file
   for (const content of validContents) {
@@ -237,7 +426,18 @@ export const combineZipContents = async (
         : filePath;
       if (!adjustedPath) continue;
 
-      // Simulate conflict resolution logic
+      // Special handling for result.json - we'll combine these later
+      if (adjustedPath === "result.json") {
+        continue;
+      }
+
+      // Track folders
+      const pathParts = adjustedPath.split("/");
+      if (pathParts.length > 1) {
+        folders.add(pathParts[0]);
+      }
+
+      // For other files: Simulate conflict resolution logic
       // In a real implementation, we'd extract timestamps from filenames
       const currentTimestamp = getTimestampFromPath(adjustedPath);
 
@@ -253,15 +453,177 @@ export const combineZipContents = async (
         // Add to the combined zip
         const fileContent = await zipEntry.async("uint8array");
         combinedZip.file(adjustedPath, fileContent);
+        totalFiles++;
       }
     }
+  }
+
+  // Statistics for message overlaps
+  let totalMessages = 0;
+  let duplicateMessages = 0;
+
+  try {
+    // Combine result.json files and gather statistics
+    const combinedResultJsonData = await combineResultJsonWithStats(
+      validContents
+    );
+    combinedZip.file("result.json", combinedResultJsonData.buffer);
+
+    totalMessages = combinedResultJsonData.totalMessages;
+    duplicateMessages = combinedResultJsonData.duplicateMessages;
+  } catch (error) {
+    throw new Error(
+      `Error combining result.json files: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
   }
 
   // Generate the combined zip file
   const combinedContent = await combinedZip.generateAsync({ type: "blob" });
 
-  // Download the file
-  saveAs(combinedContent, "combined_telegram_export.zip");
+  return {
+    blob: combinedContent,
+    totalMessages,
+    duplicateMessages,
+    folders: Array.from(folders),
+    totalFiles,
+  };
+};
+
+/**
+ * Combines multiple result.json files into a single one and returns statistics
+ */
+export const combineResultJsonWithStats = async (
+  contents: ZipContent[]
+): Promise<{
+  buffer: Uint8Array;
+  totalMessages: number;
+  duplicateMessages: number;
+}> => {
+  if (contents.length === 0) {
+    throw new Error("No valid Telegram exports to combine");
+  }
+
+  // Parse each result.json file
+  const resultJsons = [];
+  let firstChatId: number | null = null;
+  let chatName: string | null = null;
+  let chatType: string | null = null;
+  let totalInputMessages = 0;
+
+  for (const content of contents) {
+    if (!content.originalFile || !content.resultJsonPath) {
+      continue;
+    }
+
+    try {
+      const zip = await JSZip.loadAsync(content.originalFile);
+      const resultJsonPath = content.resultJsonPath;
+
+      const resultJsonEntry = zip.file(resultJsonPath);
+      if (!resultJsonEntry) {
+        continue;
+      }
+
+      const jsonText = await resultJsonEntry.async("string");
+      const resultData = JSON.parse(jsonText);
+
+      if (resultData.messages && Array.isArray(resultData.messages)) {
+        totalInputMessages += resultData.messages.length;
+      }
+
+      // Validate chat ID matching
+      if (firstChatId === null) {
+        firstChatId = resultData.id;
+        chatName = resultData.name;
+        chatType = resultData.type;
+      } else if (firstChatId !== resultData.id) {
+        throw new Error(
+          `Chat ID mismatch: ${firstChatId} !== ${resultData.id}. Cannot combine different chats.`
+        );
+      }
+
+      resultJsons.push(resultData);
+    } catch (error) {
+      throw new Error(
+        `Error processing ${content.name}: ${
+          error instanceof Error ? error.message : String(error)
+        }`
+      );
+    }
+  }
+
+  if (resultJsons.length === 0) {
+    throw new Error("No valid result.json files found");
+  }
+
+  // Create the combined result.json
+  const combinedResult = {
+    name: chatName,
+    type: chatType,
+    id: firstChatId,
+    messages: [] as TelegramMessage[], // Will hold the combined messages
+  };
+
+  // Interface for Telegram message objects
+  interface TelegramMessage {
+    id: number;
+    type: string;
+    date: string;
+    date_unixtime: string;
+    from?: string;
+    from_id?: string;
+    text?: string | { type: string; text: string }[];
+    text_entities?: { type: string; text: string }[];
+    edited?: string;
+    edited_unixtime?: string;
+    [key: string]: unknown; // For other properties we might not know about
+  }
+
+  // Map to store messages by ID to avoid duplicates
+  const messagesById = new Map<number, TelegramMessage>();
+
+  // Process all messages from all files
+  for (const resultJson of resultJsons) {
+    if (!resultJson.messages || !Array.isArray(resultJson.messages)) {
+      continue;
+    }
+
+    for (const message of resultJson.messages as TelegramMessage[]) {
+      const messageId = message.id;
+
+      // Only add if we don't have this message yet, or if we're replacing with a newer version
+      if (
+        !messagesById.has(messageId) ||
+        (message.edited && !messagesById.get(messageId)?.edited)
+      ) {
+        messagesById.set(messageId, message);
+      }
+    }
+  }
+
+  // Convert the map values to an array and sort by ID
+  combinedResult.messages = Array.from(messagesById.values()).sort(
+    (a, b) => a.id - b.id
+  );
+
+  // Calculate duplicate messages
+  const uniqueMessageCount = combinedResult.messages.length;
+  const duplicateMessages = Math.max(
+    0,
+    totalInputMessages - uniqueMessageCount
+  );
+
+  // Convert to JSON string and then to Uint8Array
+  const combinedJsonString = JSON.stringify(combinedResult, null, 1);
+  const encoder = new TextEncoder();
+
+  return {
+    buffer: encoder.encode(combinedJsonString),
+    totalMessages: uniqueMessageCount,
+    duplicateMessages,
+  };
 };
 
 /**

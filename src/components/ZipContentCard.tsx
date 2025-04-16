@@ -28,6 +28,13 @@ export interface ZipContent {
   resultJsonPath?: string;
   error?: string;
   originalFile?: File;
+  analysis?: {
+    messageCount: number;
+    dateRange: {
+      from: string;
+      to: string;
+    };
+  };
 }
 
 interface ZipContentCardProps {
@@ -99,6 +106,28 @@ const ZipContentCard = ({ content }: ZipContentCardProps) => {
                   Found result.json at: {content.resultJsonPath}
                 </Typography>
               )}
+
+            {content.analysis && (
+              <Box
+                sx={{
+                  my: 1,
+                  p: 1,
+                  bgcolor: "background.default",
+                  borderRadius: 1,
+                }}>
+                <Typography variant="body2">
+                  <strong>{content.analysis.messageCount}</strong> messages
+                </Typography>
+                {content.analysis.dateRange.from &&
+                  content.analysis.dateRange.to && (
+                    <Typography variant="body2">
+                      Date range:{" "}
+                      <strong>{content.analysis.dateRange.from}</strong> to{" "}
+                      <strong>{content.analysis.dateRange.to}</strong>
+                    </Typography>
+                  )}
+              </Box>
+            )}
 
             <Divider sx={{ my: 1 }} />
             <List dense sx={{ maxHeight: 200, overflow: "auto" }}>
